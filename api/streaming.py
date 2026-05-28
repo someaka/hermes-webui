@@ -10,7 +10,9 @@ import mimetypes
 import os
 import queue
 import re
+import shlex
 import sys
+import subprocess
 import threading
 import time
 import traceback
@@ -41,7 +43,11 @@ from api.metering import meter
 from api.run_journal import RunJournalWriter
 from api.turn_journal import append_turn_journal_event_for_stream
 from api.usage import prompt_cache_hit_percent
-from api.models import get_state_db_session_messages, reconciled_state_db_messages_for_session
+from api.models import (
+    _is_empty_partial_activity_message,
+    get_state_db_session_messages,
+    reconciled_state_db_messages_for_session,
+)
 
 # Global lock for os.environ writes. Per-session locks (_agent_lock) prevent
 # concurrent runs of the SAME session, but two DIFFERENT sessions can still
@@ -285,29 +291,117 @@ def _resolve_prefill_path(raw: str) -> Path:
     return path
 
 
+_PREFILL_SCRIPT_OUTPUT_LIMIT = 262_144
+
+
+def _prefill_not_configured() -> dict:
+    return {"status": "not_configured", "source": "none", "label": "", "messages": [], "message_count": 0}
+
+
+def _load_prefill_messages_file(file_raw: str, *, source: str = "file", status: str = "loaded") -> dict:
+    path = _resolve_prefill_path(file_raw)
+    label = path.name or "prefill file"
+    if not path.exists():
+        return {"status": "error", "source": source, "label": label, "messages": [], "message_count": 0, "error": "prefill file not found"}
+    try:
+        messages = _valid_prefill_messages(json.loads(path.read_text(encoding="utf-8")))
+        return {"status": status, "source": source, "label": label, "messages": messages, "message_count": len(messages)}
+    except Exception as exc:
+        return {"status": "error", "source": source, "label": label, "messages": [], "message_count": 0, "error": _redact_prefill_status_text(str(exc))}
+
+
+def _prefill_script_timeout(config_data: dict) -> float:
+    raw = os.getenv("HERMES_WEBUI_PREFILL_MESSAGES_SCRIPT_TIMEOUT", "") or str(config_data.get("webui_prefill_messages_script_timeout") or "")
+    try:
+        return max(0.1, min(float(raw or 5), 30.0))
+    except Exception:
+        return 5.0
+
+
+def _prefill_script_command(raw) -> list[str]:
+    if isinstance(raw, (list, tuple)):
+        return [str(part) for part in raw if str(part)]
+    parts = shlex.split(str(raw or ""))
+    if not parts:
+        return []
+    # A single script path mirrors prefill_messages_file path resolution.  More
+    # complex commands keep their argv untouched so admins can pass arguments.
+    if len(parts) == 1:
+        parts[0] = str(_resolve_prefill_path(parts[0]))
+    return parts
+
+
+def _messages_from_prefill_script_output(text: str) -> list[dict]:
+    stripped = str(text or "").strip()
+    if not stripped:
+        return []
+    try:
+        payload = json.loads(stripped)
+    except Exception:
+        payload = None
+    if isinstance(payload, dict):
+        payload = payload.get("messages")
+    messages = _valid_prefill_messages(payload)
+    if messages:
+        return messages
+    return [{"role": "user", "content": stripped}]
+
+
+def _load_prefill_messages_script(config_data: dict) -> dict:
+    script_raw = os.getenv("HERMES_WEBUI_PREFILL_MESSAGES_SCRIPT", "") or config_data.get("webui_prefill_messages_script")
+    if not script_raw:
+        return _prefill_not_configured()
+    command = _prefill_script_command(script_raw)
+    label = Path(command[0]).name if command else "prefill script"
+    if not command:
+        return {"status": "error", "source": "script", "label": label, "messages": [], "message_count": 0, "error": "prefill script is empty"}
+    try:
+        proc = subprocess.run(
+            command,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=_prefill_script_timeout(config_data),
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return {"status": "error", "source": "script", "label": label, "messages": [], "message_count": 0, "error": "prefill script timed out"}
+    except Exception as exc:
+        return {"status": "error", "source": "script", "label": label, "messages": [], "message_count": 0, "error": _redact_prefill_status_text(str(exc))}
+    if proc.returncode != 0:
+        err = _redact_prefill_status_text(proc.stderr or proc.stdout or f"prefill script exited {proc.returncode}")
+        return {"status": "error", "source": "script", "label": label, "messages": [], "message_count": 0, "error": err}
+    if len(proc.stdout.encode("utf-8")) > _PREFILL_SCRIPT_OUTPUT_LIMIT:
+        return {
+            "status": "error",
+            "source": "script",
+            "label": label,
+            "messages": [],
+            "message_count": 0,
+            "error": f"prefill script output exceeded {_PREFILL_SCRIPT_OUTPUT_LIMIT} bytes",
+        }
+    messages = _messages_from_prefill_script_output(proc.stdout)
+    return {"status": "loaded", "source": "script", "label": label, "messages": messages, "message_count": len(messages)}
+
+
 def _load_webui_prefill_context(
     config_data: Optional[dict] = None,
 ) -> dict:
     """Load configured WebUI session prefill messages.
 
-    Supports the same bounded JSON-file shape used by Hermes Agent.  WebUI does
-    not execute a configured prefill script here; session recall that requires
-    code execution should go through the normal MCP/tool path instead of an
-    always-on per-turn subprocess before SSE starts.
+    Supports the same bounded JSON-file shape used by Hermes Agent.  WebUI also
+    supports its own explicitly opt-in script hook so admins can bridge Joplin,
+    Obsidian, Notion, llm-wiki, or another local notes source into ephemeral
+    turn context without baking any one note provider into the WebUI.
     """
     cfg = config_data if isinstance(config_data, dict) else get_config()
+    script_context = _load_prefill_messages_script(cfg)
+    if script_context.get("status") != "not_configured":
+        return script_context
     file_raw = os.getenv("HERMES_PREFILL_MESSAGES_FILE", "") or str(cfg.get("prefill_messages_file") or "")
     if file_raw:
-        path = _resolve_prefill_path(file_raw)
-        label = path.name or "prefill file"
-        if not path.exists():
-            return {"status": "error", "source": "file", "label": label, "messages": [], "message_count": 0, "error": "prefill file not found"}
-        try:
-            messages = _valid_prefill_messages(json.loads(path.read_text(encoding="utf-8")))
-            return {"status": "loaded", "source": "file", "label": label, "messages": messages, "message_count": len(messages)}
-        except Exception as exc:
-            return {"status": "error", "source": "file", "label": label, "messages": [], "message_count": 0, "error": _redact_prefill_status_text(str(exc))}
-    return {"status": "not_configured", "source": "none", "label": "", "messages": [], "message_count": 0}
+        return _load_prefill_messages_file(file_raw)
+    return _prefill_not_configured()
 
 
 def _public_prefill_context_status(prefill_context: dict) -> dict:
@@ -1288,12 +1382,53 @@ def _is_provisional_title(current_title: str, messages) -> bool:
     return current == candidate
 
 
+def _detect_title_language(text: str) -> str:
+    """Best-effort language hint for title generation/validation."""
+    s = re.sub(r'\s+', ' ', str(text or '')).strip().lower()
+    if not s:
+        return ''
+    german_markers = {
+        'warum', 'werden', 'wird', 'wurde', 'hier', 'nicht', 'mehr', 'alte', 'alten',
+        'bilder', 'angezeigt', 'prüfe', 'ich', 'und', 'oder', 'mit', 'für', 'von',
+        'zu', 'ist', 'sind', 'bitte', 'kannst',
+    }
+    tokens = re.findall(r'[A-Za-zÀ-ÖØ-öø-ÿ]+', s)
+    german_hits = sum(1 for tok in tokens if tok in german_markers)
+    if re.search(r'[äöüß]', s) or german_hits >= 3:
+        return 'de'
+    return ''
+
+
+def _title_prompt_language_rule(user_text: str) -> str:
+    return "Match the language of the user question.\n"
+
+
+def _title_language_mismatch(user_text: str, title: str) -> bool:
+    """Reject obvious English titles for German conversation starts."""
+    if _detect_title_language(user_text) != 'de':
+        return False
+    candidate = str(title or '').strip().lower()
+    if not candidate:
+        return False
+    if _detect_title_language(candidate) == 'de':
+        return False
+    english_markers = {
+        'old', 'image', 'display', 'issue', 'problem', 'discussion', 'conversation',
+        'session', 'title', 'fix', 'bug', 'attachment', 'attachments', 'context',
+    }
+    tokens = re.findall(r'[a-z]+', candidate)
+    english_hits = sum(1 for tok in tokens if tok in english_markers)
+    return english_hits >= 2
+
+
 def _title_prompts(user_text: str, assistant_text: str) -> tuple[str, list[str]]:
     qa = f"User question:\n{user_text[:500]}\n\nAssistant answer:\n{assistant_text[:500]}"
+    language_rule = _title_prompt_language_rule(user_text)
     prompts = [
         (
             "Generate a short session title from this conversation start.\n"
             "Use BOTH the user's question and the assistant's visible answer.\n"
+            f"{language_rule}"
             "Return only the title text, 3-8 words, as a topic label.\n"
             "Do not use markdown, bullets, labels, or prefixes like Session Title:.\n"
             "Do not output a full sentence.\n"
@@ -1305,6 +1440,7 @@ def _title_prompts(user_text: str, assistant_text: str) -> tuple[str, list[str]]
         (
             "Rewrite this conversation start as a concise noun-phrase title.\n"
             "Use the actual topic, not the task outcome.\n"
+            f"{language_rule}"
             "Return title text only.\n"
             "Do not use markdown, bullets, labels, or prefixes like Session Title:.\n"
             "Never output acknowledgements, completion status, or meta commentary."
@@ -1660,6 +1796,8 @@ def _generate_llm_session_title_for_agent(agent, user_text: str, assistant_text:
         return None, status, ''
     title = _sanitize_generated_title(raw)
     if title:
+        if _title_language_mismatch(user_text, title):
+            return None, 'llm_language_mismatch', str(raw)[:120]
         return title, status, ''
     return None, 'llm_invalid', str(raw)[:120]
 
@@ -1692,6 +1830,8 @@ def _generate_llm_session_title_via_aux(user_text: str, assistant_text: str, age
         return None, status, ''
     title = _sanitize_generated_title(raw)
     if title:
+        if _title_language_mismatch(user_text, title):
+            return None, 'llm_language_mismatch_aux', str(raw)[:120]
         return title, status, ''
     return None, 'llm_invalid_aux', str(raw)[:120]
 
@@ -1726,7 +1866,6 @@ def _fallback_title_from_exchange(user_text: str, assistant_text: str) -> Option
     assistant_text = re.sub(r'\s+', ' ', assistant_text).strip()
     combined = f"{user_text} {assistant_text}".strip().lower()
     combined_raw = f"{user_text} {assistant_text}".strip()
-
     def _contains_latin(text: str) -> bool:
         return bool(re.search(r'[A-Za-z]', text or ''))
 
@@ -2299,6 +2438,8 @@ def _restore_display_reasoning_metadata(previous_messages, updated_messages):
     safe_indices = {idx for idx, _ in prev_safe}
     inserted_reasoning_only = 0
     for prev_idx, prev_msg in enumerate(previous_messages):
+        if _is_empty_partial_activity_message(prev_msg):
+            continue
         if prev_idx in safe_indices or not _is_reasoning_only_assistant_message(prev_msg):
             continue
         safe_pos = sum(1 for idx, _ in prev_safe if idx < prev_idx) + inserted_reasoning_only
@@ -2839,6 +2980,22 @@ def _merge_display_messages_after_agent_result(previous_display, previous_contex
         if key is not None:
             seen.add(key)
     return merged
+
+
+def _stamp_missing_message_timestamps(messages, *, now: float | None = None) -> int:
+    """Stamp missing message timestamps without collapsing transcript order.
+
+    Compacted/reconciled rows can arrive without timestamps. Assigning one
+    integer seconds value to the whole batch makes later timestamp-based display
+    merges unstable; use a subsecond sequence instead.
+    """
+    base = time.time() if now is None else float(now)
+    stamped = 0
+    for msg in messages or []:
+        if isinstance(msg, dict) and not msg.get('timestamp') and not msg.get('_ts'):
+            msg['timestamp'] = base + (stamped * 0.000001)
+            stamped += 1
+    return stamped
 
 
 def _assistant_reply_added_after_current_turn(result_messages, previous_context, msg_text) -> bool:
@@ -4141,7 +4298,8 @@ def _run_agent_streaming(
             _session_db = None
             try:
                 from hermes_state import SessionDB
-                _session_db = SessionDB()
+                _state_db_path = (Path(_profile_home) / "state.db") if _profile_home else None
+                _session_db = SessionDB(db_path=_state_db_path)
             except Exception as _db_err:
                 print(f"[webui] WARNING: SessionDB init failed — session_search will be unavailable: {_db_err}", flush=True)
             resolved_model, resolved_provider, resolved_base_url = resolve_model_provider(
@@ -4207,28 +4365,50 @@ def _run_agent_streaming(
             except Exception as _ts_err:
                 print(f"[webui] WARNING: failed to read per-session toolsets for {session_id}: {_ts_err}", flush=True)
 
-            # Fallback model from profile config (e.g. for rate-limit recovery)
-            _fallback = _cfg.get('fallback_model') or _cfg.get('fallback_providers') or None
+            # Fallback model chain from profile config (e.g. for rate-limit or
+            # provider recovery). Match Hermes CLI/gateway semantics:
+            # fallback_providers entries are tried first, then legacy
+            # fallback_model entries are appended unless they duplicate an
+            # earlier provider/model/base_url route.
+            def _fallback_entries(_raw):
+                if isinstance(_raw, dict):
+                    _items = [_raw]
+                elif isinstance(_raw, list):
+                    _items = _raw
+                else:
+                    return []
+                _entries = []
+                for _entry in _items:
+                    if not isinstance(_entry, dict):
+                        continue
+                    _provider = str(_entry.get('provider') or '').strip()
+                    _model = str(_entry.get('model') or '').strip()
+                    if not _provider or not _model:
+                        continue
+                    _entries.append({
+                        'model': _model,
+                        'provider': _provider,
+                        'base_url': _entry.get('base_url'),
+                        'api_key': _entry.get('api_key'),
+                        'key_env': _entry.get('key_env'),
+                    })
+                return _entries
+
+            _fallback_chain = []
+            _fallback_seen = set()
             _fallback_resolved = None
-            if _fallback:
-                # Normalize: support both single dict (legacy) and list (chained fallback).
-                # Use the first valid entry as the fallback passed to AIAgent.
-                _fb_entry = None
-                if isinstance(_fallback, list):
-                    for _entry in _fallback:
-                        if isinstance(_entry, dict) and _entry.get('model'):
-                            _fb_entry = _entry
-                            break
-                elif isinstance(_fallback, dict) and _fallback.get('model'):
-                    _fb_entry = _fallback
-                if _fb_entry:
-                    _fallback_resolved = {
-                        'model': _fb_entry.get('model', ''),
-                        'provider': _fb_entry.get('provider', ''),
-                        'base_url': _fb_entry.get('base_url'),
-                        'api_key': _fb_entry.get('api_key'),
-                        'key_env': _fb_entry.get('key_env'),
-                    }
+            for _fallback_key in ('fallback_providers', 'fallback_model'):
+                for _fb_entry in _fallback_entries(_cfg.get(_fallback_key)):
+                    _identity = (
+                        str(_fb_entry.get('provider') or '').strip().lower(),
+                        str(_fb_entry.get('model') or '').strip().lower(),
+                        str(_fb_entry.get('base_url') or '').strip().rstrip('/').lower(),
+                    )
+                    if _identity in _fallback_seen:
+                        continue
+                    _fallback_seen.add(_identity)
+                    _fallback_chain.append(_fb_entry)
+            _fallback_resolved = _fallback_chain or None
 
             # Build kwargs defensively — guard newer params so the WebUI
             # degrades gracefully when run against an older hermes-agent build.
@@ -5025,6 +5205,14 @@ def _run_agent_streaming(
                     # the write when the file already contains up-to-date data
                     # (i.e. it was just saved by a checkpoint).
                     _preserve_pre_compression_snapshot(s, old_sid)
+                    # The continuation is the live/tip session, not another archived
+                    # snapshot. If the in-memory object was itself loaded from a
+                    # pre-compression snapshot (possible on repeated compression chains
+                    # or stale-cache repair paths), _preserve_pre_compression_snapshot()
+                    # intentionally restores that old flag; clear it before saving the
+                    # new continuation so sidebar/discoverability code does not hide the
+                    # session that owns the completed turn.
+                    s.pre_compression_snapshot = False
                     # Always link the continuation session to its immediate predecessor
                     # (the preserved snapshot).  This OVERRIDES any prior
                     # parent_session_id because the new continuation IS the next link
@@ -5126,11 +5314,9 @@ def _run_agent_streaming(
                         'usage': _live_usage_snapshot(),
                     })
 
-                # Stamp 'timestamp' on any messages that don't have one yet
-                _now = time.time()
-                for _m in s.messages:
-                    if isinstance(_m, dict) and not _m.get('timestamp') and not _m.get('_ts'):
-                        _m['timestamp'] = int(_now)
+                # Stamp 'timestamp' on any messages that don't have one yet,
+                # preserving transcript order across compacted/reconciled batches.
+                _stamp_missing_message_timestamps(s.messages)
                 # Only auto-generate title when still default; preserves user renames
                 if s.title == 'Untitled' or s.title == 'New Chat' or not s.title:
                     s.title = title_from(s.messages, s.title)
